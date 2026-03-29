@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Si_StarterUnits — Configuration Tool</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+  h1 { color: #e94560; margin-bottom: 20px; }
+  h2 { margin: 15px 0 10px; }
+  .tabs { display: flex; gap: 5px; margin-bottom: 15px; }
+  .tab { padding: 8px 16px; background: #16213e; border: 1px solid #333; cursor: pointer; border-radius: 4px 4px 0 0; }
+  .tab.active { background: #0f3460; border-bottom-color: #0f3460; color: #e94560; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .faction-panel { background: #16213e; border: 1px solid #333; border-radius: 6px; padding: 15px; margin-bottom: 15px; }
+  .faction-sol { border-left: 4px solid #328cff; }
+  .faction-centauri { border-left: 4px solid #eb4646; }
+  .faction-alien { border-left: 4px solid #50c832; }
+  .faction-wildlife { border-left: 4px solid #c8963c; }
+  .unit-row { display: flex; align-items: center; gap: 10px; margin: 5px 0; }
+  .unit-row select { flex: 1; padding: 6px; background: #0f3460; color: #eee; border: 1px solid #555; border-radius: 4px; }
+  .unit-row input[type=number] { width: 60px; padding: 6px; background: #0f3460; color: #eee; border: 1px solid #555; border-radius: 4px; text-align: center; }
+  .btn { padding: 8px 16px; border: 1px solid #555; background: #0f3460; color: #eee; cursor: pointer; border-radius: 4px; }
+  .btn:hover { background: #1a4080; }
+  .btn-add { background: rgba(80,200,50,0.2); border-color: #50c832; color: #88ff88; }
+  .btn-remove { background: rgba(235,70,70,0.2); border-color: #eb4646; color: #ff8888; font-size: 12px; padding: 4px 8px; }
+  .btn-export { background: rgba(233,69,96,0.3); border-color: #e94560; color: #e94560; font-size: 14px; margin-top: 10px; }
+  .btn-load { background: rgba(50,140,255,0.2); border-color: #328cff; color: #88bbff; }
+  textarea { width: 100%; height: 200px; background: #0a0a1a; color: #88ff88; border: 1px solid #333; padding: 10px; font-family: monospace; font-size: 12px; border-radius: 4px; }
+  .cross-row { display: flex; gap: 10px; align-items: center; margin: 5px 0; }
+  .cross-row label { min-width: 100px; }
+  .summary { font-size: 12px; color: #888; margin-top: 5px; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Si_StarterUnits — Configuration Tool</h1>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('factions')">Faction Starters</div>
+  <div class="tab" onclick="switchTab('cross')">4-Way Cross Spawns</div>
+  <div class="tab" onclick="switchTab('export')">Export / Import</div>
+</div>
+
+<div id="tab-factions" class="tab-content active">
+  <div id="panel-sol" class="faction-panel faction-sol"><h2>Sol</h2><div class="units-list"></div>
+    <button class="btn btn-add" onclick="addUnitRow('sol')">+ Add Unit</button></div>
+  <div id="panel-centauri" class="faction-panel faction-centauri"><h2>Centauri</h2><div class="units-list"></div>
+    <button class="btn btn-add" onclick="addUnitRow('centauri')">+ Add Unit</button></div>
+  <div id="panel-alien" class="faction-panel faction-alien"><h2>Alien</h2><div class="units-list"></div>
+    <button class="btn btn-add" onclick="addUnitRow('alien')">+ Add Unit</button></div>
+  <div id="panel-wildlife" class="faction-panel faction-wildlife"><h2>Wildlife</h2><div class="units-list"></div>
+    <button class="btn btn-add" onclick="addUnitRow('wildlife')">+ Add Unit</button></div>
+</div>
+
+<div id="tab-cross" class="tab-content">
+  <p style="color:#888;margin-bottom:10px;">Cross-spawns: units from one faction spawned at another faction's base (4-way only)</p>
+  <div id="cross-entries"></div>
+  <button class="btn btn-add" onclick="addCrossEntry()">+ Add Cross Spawn Entry</button>
+</div>
+
+<div id="tab-export" class="tab-content">
+  <h2>Export JSONs</h2>
+  <button class="btn btn-export" onclick="exportAll()">Download All JSONs (zip)</button>
+  <button class="btn btn-export" onclick="exportSingle('sol')">Export sol.json</button>
+  <button class="btn btn-export" onclick="exportSingle('centauri')">Export centauri.json</button>
+  <button class="btn btn-export" onclick="exportSingle('alien')">Export alien.json</button>
+  <button class="btn btn-export" onclick="exportSingle('wildlife')">Export wildlife.json</button>
+  <button class="btn btn-export" onclick="exportCross()">Export 4way_cross_spawns.json</button>
+
+  <h2 style="margin-top:20px;">Import JSON</h2>
+  <button class="btn btn-load" onclick="document.getElementById('import-file').click()">Load JSON File</button>
+  <input type="file" id="import-file" accept=".json" onchange="importFile(event)">
+
+  <h2 style="margin-top:20px;">Preview</h2>
+  <textarea id="preview" readonly></textarea>
+</div>
+
+<script>
+const UNITS = {
+  sol: [
+    "Scout", "Rifleman", "Sniper", "Heavy", "Commando",
+    "Hover Bike", "Light Quad", "Platoon Hauler", "Heavy Quad",
+    "Light Striker", "Heavy Striker", "AA Truck", "Hover Tank",
+    "Barrage Truck", "Railgun Tank", "Pulse Truck", "Siege Tank",
+    "Sol Harvester",
+    "Gunship", "Dropship", "Fighter", "Bomber"
+  ],
+  centauri: [
+    "Militia", "Trooper", "Marksman", "Juggernaut", "Templar",
+    "Hover Bike", "Light Raider", "Squad Transport", "Heavy Raider",
+    "Assault Car", "Strike Tank", "Flak Car", "Combat Tank",
+    "Rocket Tank", "Heavy Tank", "Pyro Tank", "Crimson Tank",
+    "Cent Harvester",
+    "Shuttle", "Dreadnought", "Interceptor", "Freighter"
+  ],
+  alien: [
+    "Crab", "Shrimp", "Shocker", "Wasp", "Dragonfly", "Squid",
+    "Horned Crab", "Hunter", "Behemoth", "Scorpion",
+    "Firebug", "Goliath", "Defiler", "Colossus"
+  ],
+  wildlife: [
+    "Crab", "Shrimp", "Shocker", "Wasp", "Dragonfly", "Squid",
+    "Horned Crab", "Hunter", "Behemoth", "Scorpion",
+    "Firebug", "Goliath", "Defiler", "Colossus"
+  ]
+};
+
+const ALL_FACTIONS = ["sol", "centauri", "alien", "wildlife"];
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+  if (name === 'export') updatePreview();
+}
+
+function createUnitSelect(faction) {
+  const sel = document.createElement('select');
+  UNITS[faction].forEach(u => {
+    const opt = document.createElement('option');
+    opt.value = u; opt.textContent = u;
+    sel.appendChild(opt);
+  });
+  return sel;
+}
+
+function addUnitRow(faction) {
+  const list = document.querySelector(`#panel-${faction} .units-list`);
+  const row = document.createElement('div');
+  row.className = 'unit-row';
+  const sel = createUnitSelect(faction);
+  const inp = document.createElement('input');
+  inp.type = 'number'; inp.min = 1; inp.max = 50; inp.value = 1;
+  const btn = document.createElement('button');
+  btn.className = 'btn btn-remove'; btn.textContent = 'X';
+  btn.onclick = () => row.remove();
+  row.appendChild(sel); row.appendChild(inp); row.appendChild(btn);
+  list.appendChild(row);
+}
+
+function getFactionUnits(faction) {
+  const rows = document.querySelectorAll(`#panel-${faction} .unit-row`);
+  const units = [];
+  rows.forEach(row => {
+    const name = row.querySelector('select').value;
+    const count = parseInt(row.querySelector('input').value) || 1;
+    units.push({ name, count });
+  });
+  return units;
+}
+
+function buildFactionJSON(faction) {
+  return { units: getFactionUnits(faction) };
+}
+
+function addCrossEntry() {
+  const div = document.getElementById('cross-entries');
+  const entry = document.createElement('div');
+  entry.className = 'faction-panel';
+  entry.style.borderLeft = '4px solid #e94560';
+
+  const header = document.createElement('div');
+  header.className = 'cross-row';
+  header.innerHTML = `
+    <label>From faction:</label>
+    <select class="cross-from"><option>sol</option><option>centauri</option><option>alien</option><option>wildlife</option></select>
+    <label>At base of:</label>
+    <select class="cross-at"><option>sol</option><option>centauri</option><option>alien</option><option>wildlife</option></select>
+    <button class="btn btn-remove" onclick="this.closest('.faction-panel').remove()">Remove</button>
+  `;
+  entry.appendChild(header);
+
+  const unitsList = document.createElement('div');
+  unitsList.className = 'cross-units-list';
+  entry.appendChild(unitsList);
+
+  const addBtn = document.createElement('button');
+  addBtn.className = 'btn btn-add';
+  addBtn.textContent = '+ Add Unit';
+  addBtn.onclick = () => {
+    const from = entry.querySelector('.cross-from').value;
+    const row = document.createElement('div');
+    row.className = 'unit-row';
+    const sel = createUnitSelect(from);
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.min = 1; inp.max = 50; inp.value = 1;
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-remove'; btn.textContent = 'X';
+    btn.onclick = () => row.remove();
+    row.appendChild(sel); row.appendChild(inp); row.appendChild(btn);
+    unitsList.appendChild(row);
+  };
+  entry.appendChild(addBtn);
+  div.appendChild(entry);
+}
+
+function buildCrossJSON() {
+  const entries = document.querySelectorAll('#cross-entries .faction-panel');
+  const crossSpawns = [];
+  entries.forEach(entry => {
+    const from = entry.querySelector('.cross-from').value;
+    const at = entry.querySelector('.cross-at').value;
+    const units = [];
+    entry.querySelectorAll('.unit-row').forEach(row => {
+      units.push({
+        name: row.querySelector('select').value,
+        count: parseInt(row.querySelector('input').value) || 1
+      });
+    });
+    if (units.length > 0)
+      crossSpawns.push({ from_faction: from, at_faction: at, units });
+  });
+  return { cross_spawns: crossSpawns };
+}
+
+function updatePreview() {
+  const all = {};
+  ALL_FACTIONS.forEach(f => { all[f] = buildFactionJSON(f); });
+  all['4way_cross_spawns'] = buildCrossJSON();
+  document.getElementById('preview').value = JSON.stringify(all, null, 2);
+}
+
+function downloadJSON(filename, obj) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
+
+function exportSingle(faction) { downloadJSON(faction + '.json', buildFactionJSON(faction)); }
+function exportCross() { downloadJSON('4way_cross_spawns.json', buildCrossJSON()); }
+
+function exportAll() {
+  ALL_FACTIONS.forEach(f => exportSingle(f));
+  setTimeout(() => exportCross(), 500);
+}
+
+function importFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      const fname = file.name.replace('.json', '').toLowerCase();
+
+      if (data.cross_spawns) {
+        // Cross spawn file
+        document.getElementById('cross-entries').innerHTML = '';
+        data.cross_spawns.forEach(cs => {
+          addCrossEntry();
+          const entries = document.querySelectorAll('#cross-entries .faction-panel');
+          const last = entries[entries.length - 1];
+          last.querySelector('.cross-from').value = cs.from_faction;
+          last.querySelector('.cross-at').value = cs.at_faction;
+          cs.units.forEach(u => {
+            const addBtn = last.querySelector('.btn-add');
+            addBtn.click();
+            const rows = last.querySelectorAll('.unit-row');
+            const row = rows[rows.length - 1];
+            row.querySelector('select').value = u.name;
+            row.querySelector('input').value = u.count;
+          });
+        });
+        alert('Loaded cross spawn config');
+      } else if (data.units && ALL_FACTIONS.includes(fname)) {
+        // Faction file
+        const list = document.querySelector(`#panel-${fname} .units-list`);
+        list.innerHTML = '';
+        data.units.forEach(u => {
+          addUnitRow(fname);
+          const rows = list.querySelectorAll('.unit-row');
+          const row = rows[rows.length - 1];
+          row.querySelector('select').value = u.name;
+          row.querySelector('input').value = u.count;
+        });
+        alert('Loaded ' + fname + ' config');
+      }
+    } catch (ex) { alert('Error parsing JSON: ' + ex.message); }
+  };
+  reader.readAsText(file);
+  event.target.value = '';
+}
+
+// Add some defaults
+addUnitRow('sol'); addUnitRow('centauri'); addUnitRow('alien');
+</script>
+</body>
+</html>

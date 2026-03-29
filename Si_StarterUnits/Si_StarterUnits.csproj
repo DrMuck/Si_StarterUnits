@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>Si_StarterUnits</AssemblyName>
+    <Nullable>enable</Nullable>
+    <MSBuildWarningsAsMessages>MSB3270</MSBuildWarningsAsMessages>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Silica-MelonLoader-AdminMod" Version="*" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="..\..\Si_4way\include\netstandard2.1\*.dll">
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
