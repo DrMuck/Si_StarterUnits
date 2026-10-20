@@ -2,7 +2,7 @@
 
 > Configurable per-faction **starter unit spawns** for [Silica](https://store.steampowered.com/app/504900/Silica/) servers.
 
-When a round starts, Si_StarterUnits reads JSON config files from `UserData/StarterUnits/`, looks up each named unit's `ObjectInfo`, and spawns the configured count for each faction at that faction's HQ / Nest. Optional **4-way cross-spawn** support lets you place a Sol player's units in front of the Centauri HQ on 4-way rounds (or any other cross-team combination).
+When a round starts, Si_StarterUnits reads JSON config files from `UserData/cfg/StarterUnits/`, looks up each named unit's `ObjectInfo`, and spawns the configured count for each faction at that faction's HQ / Nest. Optional **4-way cross-spawn** support lets you place a Sol player's units in front of the Centauri HQ on 4-way rounds (or any other cross-team combination).
 
 Use the [**interactive web tool**](https://drmuck.github.io/Si_StarterUnits/) to author the JSONs visually — pick from the full unit list per faction, set counts, configure cross-spawns, then export ready-to-deploy files.
 
@@ -20,7 +20,7 @@ Use the [**interactive web tool**](https://drmuck.github.io/Si_StarterUnits/) to
 2. Install the [Silica Admin Mod](https://github.com/data-bomb/Silica) (`Si_AdminMod.dll`) — runtime dependency
 3. Copy `Si_StarterUnits.dll` to your server's `Mods/` folder
 4. (Optional) Copy [Si_4way](https://github.com/data-bomb/Silica) if you want cross-spawn support on 4-way rounds
-5. (Optional) Place your starter config JSONs into `UserData/StarterUnits/` — see below
+5. (Optional) Place your starter config JSONs into `UserData/cfg/StarterUnits/` — see below
 
 The config folder is auto-created on first run; an empty starter list = vanilla spawns. No commands needed at runtime.
 
@@ -28,7 +28,7 @@ The config folder is auto-created on first run; an empty starter list = vanilla 
 
 ### Per-faction JSON
 
-The mod looks for these files in `UserData/StarterUnits/`:
+The mod looks for these files in `UserData/cfg/StarterUnits/`:
 
 | File | Spawns at | Required units |
 |--|--|--|
@@ -85,7 +85,7 @@ The tool runs entirely in your browser (no server / no data uploaded anywhere) a
 - Build per-faction starter lists from a pre-populated dropdown of every Silica unit (so you can't typo a name)
 - Add / remove unit lines, set counts
 - Configure 4-way cross-spawn rules with the same dropdowns
-- **Export** — generates `sol.json`, `centauri.json`, `alien.json`, `wildlife.json`, and `4way_cross_spawns.json` ready to drop into `UserData/StarterUnits/`
+- **Export** — generates `sol.json`, `centauri.json`, `alien.json`, `wildlife.json`, and `4way_cross_spawns.json` ready to drop into `UserData/cfg/StarterUnits/`
 - **Import** — paste in an existing config and continue editing
 
 It's the recommended way to author the configs unless you're scripting them programmatically.

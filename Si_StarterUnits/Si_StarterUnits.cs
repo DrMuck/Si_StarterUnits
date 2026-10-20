@@ -1,6 +1,6 @@
 /*
  Si_StarterUnits — Configurable starter unit spawns per faction
- Reads JSON configs from UserData/StarterUnits/
+ Reads JSON configs from UserData/cfg/StarterUnits/
  Supports 4-way cross-spawns via Si_4way events.
 */
 
@@ -17,7 +17,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(Si_StarterUnits.StarterUnits), "Starter Units", "1.0.0", "DrMuck")]
+[assembly: MelonInfo(typeof(Si_StarterUnits.StarterUnits), "Starter Units", "1.1.0", "DrMuck")]
 [assembly: MelonGame("Bohemia Interactive", "Silica")]
 
 namespace Si_StarterUnits
@@ -54,14 +54,38 @@ namespace Si_StarterUnits
 
     public class StarterUnits : MelonMod
     {
-        private static string ConfigDir => Path.Combine(MelonEnvironment.UserDataDirectory, "StarterUnits");
+        /// <summary>UserData/cfg/StarterUnits — the server's cfg/ folder. A pre-1.1
+        /// UserData/StarterUnits/ folder is moved there once.</summary>
+        private static string ConfigDir => _configDir ?? (_configDir = ResolveConfigDir());
+        private static string _configDir;
+
+        private static string ResolveConfigDir()
+        {
+            string userData = MelonEnvironment.UserDataDirectory;
+            string dir = Path.Combine(userData, "cfg", "StarterUnits");
+            string legacy = Path.Combine(userData, "StarterUnits");
+            try
+            {
+                if (!Directory.Exists(dir) && Directory.Exists(legacy))
+                {
+                    Directory.CreateDirectory(Path.Combine(userData, "cfg"));
+                    Directory.Move(legacy, dir);
+                    MelonLogger.Msg($"[STARTER] Moved config folder {legacy} -> {dir}");
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[STARTER] Could not move {legacy} -> {dir}: {ex.Message}");
+            }
+            return dir;
+        }
         private static bool _is4WayRound = false;
         private static bool _spawnScheduled = false;
 
         public override void OnInitializeMelon()
         {
             Directory.CreateDirectory(ConfigDir);
-            MelonLogger.Msg("Si_StarterUnits v1.0.0 loaded. Configs: " + ConfigDir);
+            MelonLogger.Msg("Si_StarterUnits v1.1.0 loaded. Configs: " + ConfigDir);
         }
 
         public override void OnLateInitializeMelon()
