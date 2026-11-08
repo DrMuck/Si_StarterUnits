@@ -2,6 +2,8 @@
  Si_StarterUnits — Configurable starter unit spawns per faction
  Reads JSON configs from UserData/cfg/StarterUnits/
  Supports 4-way cross-spawns via Si_4way events.
+ 1.2.0: 2v1 lone-team multiplier from Si_VersusVote (VersusApi v2, by reflection, see VersusVoteBridge.cs): the lone
+        team's counts x LoneStarterUnitsMult; the extra units only while the team's unit cap has room.
 */
 
 using System;
@@ -17,7 +19,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(Si_StarterUnits.StarterUnits), "Starter Units", "1.1.0", "DrMuck")]
+[assembly: MelonInfo(typeof(Si_StarterUnits.StarterUnits), "Starter Units", Si_StarterUnits.StarterUnits.Version, "DrMuck")]
 [assembly: MelonGame("Bohemia Interactive", "Silica")]
 
 namespace Si_StarterUnits
@@ -54,6 +56,8 @@ namespace Si_StarterUnits
 
     public class StarterUnits : MelonMod
     {
+        public const string Version = "1.2.0";
+
         /// <summary>UserData/cfg/StarterUnits — the server's cfg/ folder. A pre-1.1
         /// UserData/StarterUnits/ folder is moved there once.</summary>
         private static string ConfigDir => _configDir ?? (_configDir = ResolveConfigDir());
@@ -85,7 +89,7 @@ namespace Si_StarterUnits
         public override void OnInitializeMelon()
         {
             Directory.CreateDirectory(ConfigDir);
-            MelonLogger.Msg("Si_StarterUnits v1.1.0 loaded. Configs: " + ConfigDir);
+            MelonLogger.Msg("Si_StarterUnits v" + Version + " loaded. Configs: " + ConfigDir);
         }
 
         public override void OnLateInitializeMelon()
@@ -192,9 +196,13 @@ namespace Si_StarterUnits
                     Structure baseStruct = team.Structures.Count > 0 ? team.Structures[0] : null;
                     if (baseStruct == null) { MelonLogger.Warning($"[STARTER] No base structure for '{factionName}'"); continue; }
 
-                    int spawned = SpawnUnitsAroundStructure(config.Units, team, baseStruct, infoByName);
+                    int mult = VersusVoteBridge.MultFor(team, out string loneName);
+                    if (mult > 1)
+                        MelonLogger.Msg($"[StarterUnits] 2v1 lone team {loneName}: counts x{mult} (Si_VersusVote)");
+
+                    int spawned = SpawnUnitsAroundStructure(config.Units, team, baseStruct, infoByName, mult);
                     totalSpawned += spawned;
-                    MelonLogger.Msg($"[STARTER] {factionName}: spawned {spawned} units");
+                    MelonLogger.Msg($"[STARTER] {factionName}: spawned {spawned} units" + (mult > 1 ? $" (2v1 lone team x{mult})" : ""));
                 }
                 catch (Exception ex)
                 {
@@ -239,17 +247,24 @@ namespace Si_StarterUnits
             yield break;
         }
 
+        /// <param name="mult">integer multiplier (2v1 lone team); 1 = the JSON counts as they are. The JSON counts are
+        /// always spawned (as before 1.2.0); the (mult - 1) x count extra units are added only while the team's vanilla
+        /// unit cap for that unit type has room (UnitCapEntry.Max, 0 = no cap), counting the units already on the map
+        /// and every starter spawned before them. Skipped extras are logged.</param>
         private static int SpawnUnitsAroundStructure(List<UnitEntry> units, Team team,
-            Structure baseStruct, Dictionary<string, ObjectInfo> infoByName)
+            Structure baseStruct, Dictionary<string, ObjectInfo> infoByName, int mult = 1)
         {
             Vector3 hqPos = baseStruct.transform.position;
             Vector3 hqForward = baseStruct.transform.forward;
             float radius = 120f;
+            if (mult < 1) mult = 1;
 
-            // Flatten to individual spawns
+            // Flatten to individual spawns: the JSON counts first, then the 2v1 extras
             var spawnList = new List<(string name, ObjectInfo info)>();
+            var extras = new List<(string name, ObjectInfo info)>();
             foreach (var entry in units)
             {
+                if (entry == null || string.IsNullOrEmpty(entry.Name)) continue;
                 if (!infoByName.TryGetValue(entry.Name, out ObjectInfo unitInfo))
                 {
                     MelonLogger.Warning($"[STARTER] Unit not found: '{entry.Name}'");
@@ -257,7 +272,11 @@ namespace Si_StarterUnits
                 }
                 for (int i = 0; i < entry.Count; i++)
                     spawnList.Add((entry.Name, unitInfo));
+                for (int i = 0; i < entry.Count * (mult - 1); i++)
+                    extras.Add((entry.Name, unitInfo));
             }
+            if (extras.Count > 0)
+                AddExtrasWithinCap(team, spawnList, extras);
 
             int total = spawnList.Count;
             int spawned = 0;
@@ -298,6 +317,48 @@ namespace Si_StarterUnits
             }
 
             return spawned;
+        }
+
+        /// <summary>Appends the extras to spawnList while the team's unit cap per cap type has room (see SpawnUnitsAroundStructure).</summary>
+        private static void AddExtrasWithinCap(Team team, List<(string name, ObjectInfo info)> spawnList, List<(string name, ObjectInfo info)> extras)
+        {
+            var projected = new Dictionary<UnitCapEntry, int>();
+            int CapOf(ObjectInfo info, out UnitCapEntry? entry)
+            {
+                entry = null;
+                try { entry = team.GetUnitTypeCapEntryForUnit(info); } catch { }
+                if (entry == null) return 0;
+                if (!projected.ContainsKey(entry)) projected[entry] = entry.Current;
+                int max = 0; try { max = entry.Max; } catch { }
+                return max;
+            }
+            try { team.UpdateUnitCapValues(); } catch { }
+            foreach (var s in spawnList)
+            {
+                CapOf(s.info, out UnitCapEntry? e);
+                if (e != null) projected[e] += Math.Max(0, s.info.UnitCapValue);
+            }
+            var skipped = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            int added = 0;
+            foreach (var x in extras)
+            {
+                int max = CapOf(x.info, out UnitCapEntry? e);
+                int cost = Math.Max(0, x.info.UnitCapValue);
+                if (e != null && max > 0 && projected[e] + cost > max)
+                {
+                    skipped.TryGetValue(x.name, out int n);
+                    skipped[x.name] = n + 1;
+                    continue;
+                }
+                if (e != null) projected[e] += cost;
+                spawnList.Add(x);
+                added++;
+            }
+            string teamName = "";
+            try { teamName = team.TeamShortName; } catch { }
+            if (skipped.Count > 0)
+                MelonLogger.Msg($"[StarterUnits] 2v1 extras for {teamName}: {added} added, skipped at the unit cap: " +
+                                string.Join(", ", skipped.Select(kv => kv.Key + " x" + kv.Value)));
         }
 
         private static Team FindTeamByFaction(string faction)

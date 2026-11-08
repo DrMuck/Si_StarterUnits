@@ -3,14 +3,23 @@
     <TargetFramework>netstandard2.1</TargetFramework>
     <AssemblyName>Si_StarterUnits</AssemblyName>
     <Nullable>enable</Nullable>
-    <MSBuildWarningsAsMessages>MSB3270</MSBuildWarningsAsMessages>
+    <MSBuildWarningsAsMessages>MSB3270;MSB3277</MSBuildWarningsAsMessages>
+    <!-- Silica branch to build against: "test" (Steam test branch 1.0.x, the default here) or "default" (0.9.47).
+         Reference DLLs come from Projects\_silica_refs\<branch>\. The default build goes to bin\Release\default\:
+         dotnet build -c Release -p:SilicaBranch=default -->
+    <SilicaBranch Condition="'$(SilicaBranch)' == ''">test</SilicaBranch>
+    <SilicaRefs>..\..\_silica_refs\$(SilicaBranch)\</SilicaRefs>
+    <OutputPath Condition="'$(SilicaBranch)' == 'default'">bin\$(Configuration)\default\</OutputPath>
+    <IntermediateOutputPath Condition="'$(SilicaBranch)' == 'default'">obj\$(Configuration)\default\</IntermediateOutputPath>
+    <AppendTargetFrameworkToOutputPath Condition="'$(SilicaBranch)' == 'default'">false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Silica-MelonLoader-AdminMod" Version="*" />
-  </ItemGroup>
-  <ItemGroup>
-    <Reference Include="..\..\Si_4way\include\netstandard2.1\*.dll">
-      <Private>False</Private>
-    </Reference>
+    <Reference Include="$(SilicaRefs)SilicaCore.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)MelonLoader.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)0Harmony.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)Newtonsoft.Json.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)UnityEngine.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)UnityEngine.CoreModule.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)UnityEngine.TerrainModule.dll"><Private>False</Private></Reference>
   </ItemGroup>
 </Project>
