@@ -1,5 +1,5 @@
 /*
- Si_StarterUnits 1.3.0 — placement validation for starter units.
+ Si_StarterUnits 1.3.1 — placement validation for starter units.
 
  Every starter gets a position that is checked before Game.SpawnPrefab:
    1. Landing: Physics.BoxCast straight down with the unit's box (the prefab's solid colliders, ObjectInfo.PhysicalBounds
@@ -8,18 +8,29 @@
       (TeleportUI) and units that fell through the ground (Unit.UpdateFallThroughGround). The box ends in contact with
       the first static surface under it and overlaps nothing on those layers. A Physics.CheckBox at the cast origin
       guards against the one blind spot of a cast (colliders that already contain the start box are not reported).
-   2. Height: the landing surface may be at most max_height_above_terrain_m above the terrain at that spot (no roofs,
-      tanks, rock or cliff tops) and at most max_step_from_base_m above/below the terrain at the base.
+      The cast comes from above, so a unit always lands ON the top surface (IndustrialQuarter's metal floor), never on
+      the heightmap underneath it.
+   2. Level: the landing surface may be at most max_step_from_base_m above/below the BASE GROUND = the surface the base
+      actually stands on (ray down from the base, base structures and units ignored; 1.3.0 took the heightmap there,
+      which is 13 m under an IndustrialQuarter platform and ~100 m under a Citadel plateau).
+      Elevated surface (1.3.1): a non-terrain landing more than max_height_above_terrain_m above BOTH the heightmap at
+      the spot and the base ground (roof, tank, catwalk, pillar or rock top) is accepted only when the ground-vehicle
+      navmesh ("Small Vehicle") has a node there on its main component, i.e. it is drivable ground connected to the
+      map. Only for units whose own graph cannot tell (alien Voxel Graph, which covers walls and roofs; flying units);
+      vehicles and infantry are judged by their own graph in 4.
    3. Clearance: Physics.OverlapBox of the landed box against static world layers + units (Character, Vehicle,
       Dynamic) + Invisible Walls, triggers ignored; plus a 2D spacing check against the starters already placed in
       this pass (radius + radius + unit_gap_m).
    4. Navmesh (not for flying units): the nearest walkable node of the unit's own A* graph (Seeker.graphMask, as
       GameAI.GetPointValidForAI / Unit.GetFallThroughNavmeshLanding / MP_Strategy.GetStartPointOffNavmesh query it)
       within nav_max_horizontal_delta_m / nav_max_height_delta_m (+ voxel size for the alien point graph). With
-      nav_island_check the node must lie in the base's connected component (GraphNode.Area): no isolated ledges.
+      nav_island_check the node must lie in the REFERENCE component: the graph's main component (most walkable nodes)
+      when a probe around the base on the base's level reaches it, else the component of the base vote. The reference
+      is kept as a node and compared at query time (A* renumbers GraphNode.Area after graph updates). Roof, tank and
+      pillar tops are separate small components (or have no node at all) and fail here.
  The search starts at the 1.2.0 ring slot and walks outwards in tiers around it (radius limits min_radius..max_radius
  from the base), first valid spot wins. No valid spot within max_candidates_per_unit: best candidate (least severe
- failure, then closest to the slot) with a warning. A unit is never dropped.
+ failure, then closest to the slot) with a warning, always at its landed pose. A unit is never dropped.
 */
 
 using System;
@@ -45,10 +56,18 @@ namespace Si_StarterUnits
         [JsonProperty("nav_max_horizontal_delta_m")] public float NavMaxHorizontal = 3.0f;
         [JsonProperty("nav_max_height_delta_m")] public float NavMaxHeight = 3.0f;
         [JsonProperty("nav_island_check")] public bool NavIslandCheck = true;
-        /// <summary>Landing surface more than this above the terrain at that spot = rooftop / top of a rock or cliff mesh.</summary>
+        /// <summary>1.3.1: a non-terrain landing more than this above both the heightmap at the spot and the base
+        /// ground is an "elevated surface"; for alien ground and flying units it must be on the main ground-vehicle
+        /// navmesh (else roof / tank / pillar top). Vehicles and infantry: not used (their own navmesh decides).
+        /// (1.3.0: hard limit above the heightmap for every unit.)</summary>
         [JsonProperty("max_height_above_terrain_m")] public float MaxAboveTerrain = 4f;
-        /// <summary>Landing ground more than this above or below the terrain at the base structure = other level.</summary>
+        /// <summary>Landing ground more than this above or below the base ground (the surface the base stands on;
+        /// 1.3.0: the heightmap at the base) = other level.</summary>
         [JsonProperty("max_step_from_base_m")] public float MaxStepFromBase = 25f;
+        /// <summary>TEST ONLY (1.3.1): live spawns use the 1.2.0 placement exactly (ring slot, heightmap + 1 m, no
+        /// checks), which puts units under IndustrialQuarter's metal floor. Exists so the post-check's under-floor
+        /// test can be shown to fire. Never enable on a played server. The audit ignores it.</summary>
+        [JsonProperty("test_legacy_heightmap_placement")] public bool LegacyHeightmap = false;
         [JsonProperty("post_check_delay_s")] public float PostCheckDelay = 5f;
         [JsonProperty("queries_per_frame")] public int QueriesPerFrame = 200;
         /// <summary>Runs the layout audit (as "!starteraudit layouts") once per map per server run, after the
@@ -137,12 +156,16 @@ namespace Si_StarterUnits
         public string Map = "";
         public string Label = "";
         public Vector3 BasePos;
-        public float BaseGroundY;  // terrain height at the base (an HQ may be spawned raised)
+        public float BaseGroundY;  // surface the base stands on (Placer.BaseGround; an HQ may be spawned raised)
+        public string BaseGroundInfo = "";
         public Vector3 BaseForward = Vector3.forward;
         public bool IgnoreUnits;   // audit: judge the static world only
+        public bool Audit;         // audit: also test the 1.2.0 slot and the chosen spot for "under a floor"
         public readonly List<(Vector3 pos, float r, string name)> Placed = new List<(Vector3, float, string)>();
-        public readonly Dictionary<int, uint?> RefAreas = new Dictionary<int, uint?>();
+        /// <summary>Reference node per graph mask (null = no island test); its Area is read at query time.</summary>
+        public readonly Dictionary<int, (GraphNode? node, string how)> RefNodes = new Dictionary<int, (GraphNode?, string)>();
         public int AsPlanned, Relocated, Fallback, Unchecked, Spawned;
+        public int LegacyUnder, ChosenUnder;
         public int Queries, QueriesSinceYield;
         public bool NavReady;
         public string NavState = "";
@@ -150,8 +173,9 @@ namespace Si_StarterUnits
 
         public string Summary(string verb) =>
             $"[STARTER] {verb} {Map} {Label}: {Total} units, {AsPlanned} as planned, {Relocated} relocated, {Fallback} fallback" +
-            (Unchecked > 0 ? $", {Unchecked} unchecked (validate_placement off)" : "") +
-            $" ({Queries} queries{(NavReady ? "" : ", no navmesh test: " + NavState)})";
+            (Unchecked > 0 ? $", {Unchecked} unchecked (validate_placement off / test placement)" : "") +
+            (Audit ? $", under a floor: 1.2.0 slot {LegacyUnder}, chosen {ChosenUnder}" : "") +
+            $" ({Queries} queries, base ground {BaseGroundInfo}{(NavReady ? "" : ", no navmesh test: " + NavState)})";
     }
 
     internal static class Placer
@@ -161,8 +185,10 @@ namespace Si_StarterUnits
         const float Lift = 0.25f;
         const float NavSearch = 15f;
         const float NavRefSearch = 80f;
-        // Failure severities (lower = closer to valid). Candidates >= NoPose have no landed pose.
-        const int SevUnits = 3, SevIsland = 4, SevNav = 5, SevRoof = 6, SevStep = 6, SevStatic = 7, SevNoPose = 8, SevSpacing = 9;
+        // Failure severities (lower = closer to valid). Candidates >= NoPose have no landed pose. 1.3.1: another level
+        // on the reference component (can drive back) is less bad than an elevated top or an isolated navmesh piece.
+        const int SevUnits = 3, SevStep = 4, SevRoof = 5, SevIsland = 6, SevNav = 6, SevStatic = 7, SevNoPose = 8, SevSpacing = 9;
+        const float SurfaceRayUp = 500f;
 
         static readonly Collider[] s_Buf = new Collider[16];
         static readonly float[] s_Tiers = { 12f, 25f, 40f, 60f, 85f, 115f, 150f, 190f };
@@ -171,9 +197,9 @@ namespace Si_StarterUnits
         static readonly HashSet<string> s_SpecLogged = new HashSet<string>();
 
         static bool s_MasksReady;
-        static int s_CastMask, s_StaticMask, s_UnitMask, s_WallMask, s_TerrainLayer = -1;
+        static int s_CastMask, s_StaticMask, s_UnitMask, s_WallMask, s_SurfaceSkip, s_TerrainLayer = -1;
 
-        static void EnsureMasks()
+        internal static void EnsureMasks()
         {
             if (s_MasksReady) return;
             s_CastMask = GamePhysics.TRACELAYERMASK_IGNOREDYNAMIC;
@@ -182,8 +208,85 @@ namespace Si_StarterUnits
             s_StaticMask = s_CastMask & ~terrain & ~nonBlocking;
             s_UnitMask = LayerMask.GetMask("Character", "Vehicle", "Dynamic");
             s_WallMask = LayerMask.GetMask("Invisible Walls");
+            // not ground for the surface ray: AI steering volumes (palms on CrimsonPeak) and non-blocking layers
+            s_SurfaceSkip = nonBlocking | LayerMask.GetMask("AIVehicleObstacle");
             s_TerrainLayer = GamePhysics.LAYER_TERRAIN;
             s_MasksReady = true;
+        }
+
+        // ---------------------------------------------------------------- surface (1.3.1)
+
+        static readonly RaycastHit[] s_SurfHits = new RaycastHit[32];
+        static readonly Dictionary<int, bool> s_IsGoCol = new Dictionary<int, bool>();
+
+        static bool IsGameObjectCollider(Collider c)
+        {
+            int id = c.GetInstanceID();
+            if (s_IsGoCol.TryGetValue(id, out bool v)) return v;
+            try { v = c.GetComponentInParent<BaseGameObject>() != null; } catch { v = false; }
+            if (s_IsGoCol.Count > 20000) s_IsGoCol.Clear();
+            s_IsGoCol[id] = v;
+            return v;
+        }
+
+        /// <summary>First world surface hit by a ray straight down from <paramref name="fromY"/> over
+        /// <paramref name="dist"/> m (IGNOREDYNAMIC, triggers ignored), skipping colliders of BaseGameObjects (base
+        /// structures, units) and non-ground layers. This is the surface a unit stands on there: the metal floor on
+        /// IndustrialQuarter, not the heightmap under it.</summary>
+        internal static bool SurfaceHit(float x, float z, float fromY, float dist, out RaycastHit best)
+        {
+            EnsureMasks();
+            best = default;
+            int n = Physics.RaycastNonAlloc(new Vector3(x, fromY, z), Vector3.down, s_SurfHits, dist, s_CastMask & ~s_SurfaceSkip, QueryTriggerInteraction.Ignore);
+            float bd = float.MaxValue; bool any = false;
+            for (int i = 0; i < n; i++)
+            {
+                var h = s_SurfHits[i];
+                if (h.collider == null || h.distance >= bd) continue;
+                if (h.collider.gameObject.layer != s_TerrainLayer && IsGameObjectCollider(h.collider)) continue;
+                bd = h.distance; best = h; any = true;
+            }
+            return any;
+        }
+
+        /// <summary>Top surface at x/z (ray from 500 m above the heightmap / refY), else null.</summary>
+        internal static float? SurfaceY(float x, float z, float refY)
+        {
+            float? th = TerrainHeight(new Vector3(x, 0f, z));
+            float top = Mathf.Max(th ?? refY, refY) + SurfaceRayUp;
+            return SurfaceHit(x, z, top, SurfaceRayUp * 2f + 100f, out RaycastHit h) ? h.point.y : (float?)null;
+        }
+
+        /// <summary>Ground the base stands on: first world surface below the base pivot (from 10 m above it, base
+        /// structures ignored; human HQs are spawned some metres above the floor). Never the bare heightmap when a
+        /// surface exists; no hit at all: the pivot height.</summary>
+        internal static float BaseGround(Vector3 basePos, out string info)
+        {
+            float? th = TerrainHeight(basePos);
+            if (SurfaceHit(basePos.x, basePos.z, basePos.y + 10f, 120f, out RaycastHit h))
+            {
+                bool terr = h.collider.gameObject.layer == s_TerrainLayer;
+                info = $"{h.point.y:F0} ({(terr ? "terrain" : Describe(h.collider))}, {h.point.y - (th ?? h.point.y):F1} m above the heightmap)";
+                return h.point.y;
+            }
+            info = $"{basePos.y:F0} (no surface under the base, pivot height)";
+            return basePos.y;
+        }
+
+        /// <summary>"" or why a unit whose feet are at <paramref name="feetY"/> and whose top is
+        /// <paramref name="height"/> m above them is UNDER a walkable static surface at x/z: the first surface from
+        /// above is not terrain, faces up (normal.y > 0.7) and lies more than 0.5 m above the unit's top. The
+        /// IndustrialQuarter fault of 1.2.0: heightmap + 1 m under a 13 m metal floor.</summary>
+        internal static string UnderFloor(float x, float feetY, float z, float height)
+        {
+            float? th = TerrainHeight(new Vector3(x, 0f, z));
+            float top = Mathf.Max(th ?? feetY, feetY) + SurfaceRayUp;
+            if (!SurfaceHit(x, z, top, SurfaceRayUp + 50f + (top - feetY), out RaycastHit h)) return "";
+            if (h.collider.gameObject.layer == s_TerrainLayer || h.normal.y < 0.7f) return "";
+            float above = h.point.y - feetY;
+            if (above <= height + 0.5f) return "";
+            string feet = th.HasValue && Mathf.Abs(feetY - th.Value) < 3f ? ", feet on the heightmap" : th.HasValue ? $", feet {feetY - th.Value:F1} m above the heightmap" : "";
+            return $"under a floor: {Describe(h.collider)} {above:F1} m above its feet{feet}";
         }
 
         // ---------------------------------------------------------------- helpers
@@ -312,6 +415,84 @@ namespace Si_StarterUnits
             }
             catch { }
             return mask.containsAllGraphs ? "all graphs" : "mask " + mask.value;
+        }
+
+        // ---------------------------------------------------------------- main component (1.3.1)
+
+        static AstarPath? s_MainAstar;
+        static readonly Dictionary<int, (GraphNode? node, string info)> s_MainRef = new Dictionary<int, (GraphNode?, string)>();
+
+        static bool Alive(GraphNode? n)
+        {
+            if (n == null) return false;
+            try { return !n.Destroyed && n.Walkable; } catch { return false; }
+        }
+
+        internal static uint? AreaOf(GraphNode? n)
+        {
+            if (!Alive(n)) return null;
+            try { return n!.Area; } catch { return null; }
+        }
+
+        /// <summary>Main connected component of the graphs in the mask (the GraphNode.Area with the most walkable
+        /// nodes), returned as one REFERENCE NODE of it, as Si_MapBalance's SiteTest does: A* renumbers areas after
+        /// graph updates (CrystalChasm: one component seen as 13955, 13957, 13959), so callers compare a node's Area
+        /// with the reference node's Area read at the same moment. Cached per AstarPath instance and mask; recomputed
+        /// when the reference node was destroyed (tile rebuilt by a navmesh cut).</summary>
+        internal static GraphNode? MainRef(GraphMask mask, out string info)
+        {
+            if (!ReferenceEquals(s_MainAstar, AstarPath.active)) { s_MainRef.Clear(); s_MainAstar = AstarPath.active; }
+            if (s_MainRef.TryGetValue(mask.value, out var cached) && (cached.node == null || Alive(cached.node)))
+            { info = cached.info; return cached.node; }
+            var counts = new Dictionary<uint, int>();
+            var sample = new Dictionary<uint, GraphNode>();
+            int total = 0;
+            try
+            {
+                var graphs = AstarPath.active.data.graphs;
+                for (int i = 0; i < graphs.Length && i < 32; i++)
+                {
+                    var g = graphs[i];
+                    if (g == null || ((mask.value >> i) & 1) == 0) continue;
+                    g.GetNodes(n =>
+                    {
+                        if (n == null || !n.Walkable) return;
+                        uint a = n.Area;
+                        counts.TryGetValue(a, out int c);
+                        counts[a] = c + 1;
+                        if (!sample.ContainsKey(a)) sample[a] = n;
+                        total++;
+                    });
+                }
+            }
+            catch (Exception ex) { info = "node walk failed: " + ex.Message; s_MainRef[mask.value] = (null, info); return null; }
+            uint bestA = 0; int bestN = 0;
+            foreach (var kv in counts) if (kv.Value > bestN) { bestN = kv.Value; bestA = kv.Key; }
+            GraphNode? main = bestN > 0 ? sample[bestA] : null;
+            info = $"{total} walkable nodes, {counts.Count} components, main {bestN}";
+            s_MainRef[mask.value] = (main, info);
+            return main;
+        }
+
+        static bool s_VehMaskResolved;
+        static GraphMask s_VehMask;
+        static bool s_HasVehMask;
+
+        /// <summary>The ground-vehicle graph ("Small Vehicle"), the oracle for "is this elevated surface drivable
+        /// ground" for units whose own graph covers walls and roofs (alien Voxel Graph) or that fly.</summary>
+        static bool VehicleMask(out GraphMask m)
+        {
+            if (!s_VehMaskResolved)
+            {
+                try
+                {
+                    var named = GameAI.NamedGraphMasks;
+                    if (named != null && named.TryGetValue("Small Vehicle", out var v)) { s_VehMask = v; s_HasVehMask = true; s_VehMaskResolved = true; }
+                }
+                catch { }
+            }
+            m = s_VehMask;
+            return s_HasVehMask;
         }
 
         // ---------------------------------------------------------------- unit spec
@@ -495,9 +676,12 @@ namespace Si_StarterUnits
             fwd.Normalize();
             Vector3 slotDir = Quaternion.Euler(0f, slotAngle, 0f) * fwd;
             Vector3 slot = ctx.BasePos + slotDir * cfg.RingRadius;
-            slot.y = TerrainHeight(slot) ?? ctx.BasePos.y;
+            EnsureMasks();
+            float? slotTerrain = TerrainHeight(slot);
+            // 1.3.1: the slot's height is the top surface there (metal floor, rock plateau), never the heightmap under it
+            slot.y = SurfaceY(slot.x, slot.z, Mathf.Max(ctx.BaseGroundY, slotTerrain ?? ctx.BaseGroundY)) ?? Mathf.Max(slotTerrain ?? ctx.BaseGroundY, ctx.BaseGroundY);
 
-            // 1.2.0 placement: ring slot, terrain + 1 m, facing outwards
+            // ring slot on the top surface + 1 m, facing outwards (= 1.2.0 wherever the heightmap is the surface)
             var res = new PlaceResult
             {
                 Planned = slot,
@@ -506,17 +690,29 @@ namespace Si_StarterUnits
                 SlotReason = "",
                 FallbackReason = "",
             };
-            if (!cfg.Enabled)
+            if (ctx.Audit)
             {
+                // the 1.2.0 position (heightmap + 1 m): under a floor?
+                if (slotTerrain.HasValue && UnderFloor(slot.x, slotTerrain.Value + 1f, slot.z, 2f * u.Extents.y).Length > 0) ctx.LegacyUnder++;
+                ctx.Queries++; ctx.QueriesSinceYield++;
+            }
+            if (cfg.LegacyHeightmap || !cfg.Enabled)
+            {
+                if (cfg.LegacyHeightmap)
+                {
+                    // TEST ONLY: exactly 1.2.0 (heightmap + 1 m), to reproduce the under-floor fault for the post-check
+                    res.Position = new Vector3(slot.x, (slotTerrain ?? slot.y) + 1f, slot.z);
+                    res.Planned = res.Position;
+                }
                 res.Outcome = PlaceOutcome.Unchecked;
                 ctx.Unchecked++;
                 ctx.Placed.Add((res.Position, u.Radius, u.Name));
                 return res;
             }
 
-            EnsureMasks();
             bool nav = ctx.NavReady && !u.Flying;
-            uint? refArea = nav && cfg.NavIslandCheck ? RefArea(ctx, u, fwd, cfg) : null;
+            GraphNode? refNode = null; string refHow = "";
+            if (nav && cfg.NavIslandCheck) (refNode, refHow) = RefNode(ctx, u, fwd, cfg);
 
             int bestSev = int.MaxValue; float bestD = float.MaxValue;
             Vector3 bestPos = res.Position; Quaternion bestRot = res.Rotation; string bestReason = "", bestLanded = "";
@@ -529,7 +725,7 @@ namespace Si_StarterUnits
                 Vector3 radial = cand - ctx.BasePos; radial.y = 0f;
                 Quaternion rot = Quaternion.LookRotation(radial.sqrMagnitude > 1e-4f ? radial.normalized : slotDir, Vector3.up);
 
-                int sev = Evaluate(u, ctx, cand, rot, nav, refArea, cfg, out Vector3 pivot, out string reason, out string landed);
+                int sev = Evaluate(u, ctx, cand, rot, nav, refNode, refHow, cfg, out Vector3 pivot, out string reason, out string landed);
                 if (evaluated == 1) res.SlotReason = reason;
                 if (sev == 0)
                 {
@@ -537,6 +733,7 @@ namespace Si_StarterUnits
                     res.Outcome = evaluated == 1 ? PlaceOutcome.AsPlanned : PlaceOutcome.Relocated;
                     if (evaluated == 1) ctx.AsPlanned++; else ctx.Relocated++;
                     ctx.Placed.Add((pivot, u.Radius, u.Name));
+                    AuditChosen(ctx, u, res);
                     return res;
                 }
                 float d = Dist2D(cand, slot);
@@ -550,9 +747,22 @@ namespace Si_StarterUnits
             res.Outcome = PlaceOutcome.Fallback;
             ctx.Fallback++;
             if (bestSev < SevNoPose) { res.Position = bestPos; res.Rotation = bestRot; res.FallbackReason = bestReason; res.Landed = bestLanded; }
-            else res.FallbackReason = "no candidate landed, 1.2.0 ring position (terrain + 1 m)";
+            else res.FallbackReason = "no candidate landed, ring slot on the top surface + 1 m";   // res.Position = slot (surface) + 1 m
             ctx.Placed.Add((res.Position, u.Radius, u.Name));
+            AuditChosen(ctx, u, res);
             return res;
+        }
+
+        /// <summary>Audit self-test: the chosen position must not be under a floor (expected 0).</summary>
+        static void AuditChosen(PassContext ctx, UnitSpec u, PlaceResult r)
+        {
+            if (!ctx.Audit) return;
+            ctx.Queries++; ctx.QueriesSinceYield++;
+            float feet = r.Position.y + (r.Rotation * u.Center).y - u.Extents.y;
+            string under = UnderFloor(r.Position.x, feet, r.Position.z, 2f * u.Extents.y);
+            if (under.Length == 0) return;
+            ctx.ChosenUnder++;
+            MelonLogger.Warning($"[STARTER] audit {ctx.Map} {ctx.Label} '{u.Name}' at {V(r.Position)}: chosen spot {under}");
         }
 
         /// <summary>The slot itself, then tiers of 8 points around it (tangential first, then outwards, inwards,
@@ -574,7 +784,7 @@ namespace Si_StarterUnits
 
         /// <returns>0 = valid, else a severity (see Sev*); <paramref name="pivot"/> is the landed pose when severity
         /// is below SevNoPose.</returns>
-        static int Evaluate(UnitSpec u, PassContext ctx, Vector3 cand, Quaternion rot, bool nav, uint? refArea,
+        static int Evaluate(UnitSpec u, PassContext ctx, Vector3 cand, Quaternion rot, bool nav, GraphNode? refNode, string refHow,
             PlacementConfig cfg, out Vector3 pivot, out string reason, out string landed)
         {
             pivot = cand;
@@ -594,9 +804,10 @@ namespace Si_StarterUnits
 
             float? terrainAt = TerrainHeight(cand);
             bool hasTerrain = terrainAt.HasValue;
-            float groundRef = terrainAt ?? ctx.BasePos.y;
+            float groundRef = terrainAt ?? ctx.BaseGroundY;
             Vector3 half = new Vector3(u.Extents.x + cfg.ClearanceMargin, u.Extents.y, u.Extents.z + cfg.ClearanceMargin);
-            Vector3 origin = new Vector3(cand.x, Mathf.Max(groundRef, ctx.BasePos.y) + CastHeight + half.y, cand.z);
+            // from well above the highest of heightmap, base pivot and base ground: the box lands on the top surface
+            Vector3 origin = new Vector3(cand.x, Mathf.Max(groundRef, Mathf.Max(ctx.BasePos.y, ctx.BaseGroundY)) + CastHeight + half.y, cand.z);
 
             // a cast does not report colliders that already contain its start box
             ctx.Queries++; ctx.QueriesSinceYield++;
@@ -611,7 +822,7 @@ namespace Si_StarterUnits
                 }
             }
 
-            float castDist = origin.y - (groundRef - 30f);
+            float castDist = origin.y - (Mathf.Min(groundRef, ctx.BaseGroundY) - 30f);
             ctx.Queries++; ctx.QueriesSinceYield++;
             if (!Physics.BoxCast(origin, half, Vector3.down, out RaycastHit hit, rot, castDist, s_CastMask, QueryTriggerInteraction.Ignore))
             {
@@ -625,19 +836,41 @@ namespace Si_StarterUnits
             string landedOn = onTerrain ? "terrain" : Describe(hit.collider!);
             // pivot such that the unit's physical box sits where the cast box came to rest, lifted a little
             pivot = boxCenter - rot * u.Center + Vector3.up * Lift;
-            landed = $"landed on {landedOn}, ground {groundY - groundRef:F1} m above terrain";
-
-            // height: not on a roof / rock / cliff top, not on another level than the base
-            if (hasTerrain && groundY - groundRef > cfg.MaxAboveTerrain)
-            {
-                reason = $"on top of {landedOn}, {groundY - groundRef:F1} m above terrain";
-                return SevRoof;
-            }
+            float aboveTerrain = hasTerrain ? groundY - groundRef : 0f;
             float step = groundY - ctx.BaseGroundY;
+            string where = $"landed on {landedOn}, {aboveTerrain:F1} m above terrain, {(step >= 0 ? "+" : "")}{step:F1} m vs base ground";
+            landed = where;
+
+            // level: not on another level than the base (base ground = the surface the base stands on)
             if (Mathf.Abs(step) > cfg.MaxStepFromBase)
             {
-                reason = $"ground {(step > 0 ? "+" : "")}{step:F0} m vs the base ground (landed on {landedOn})";
+                reason = $"other level: {where}";
                 return SevStep;
+            }
+
+            // elevated surface (roof / tank / catwalk / pillar or rock top) for units whose own graph cannot tell:
+            // accepted only on the main ground-vehicle navmesh (drivable ground connected to the map)
+            if ((u.Flying || u.NavSlack > 0f) && !onTerrain && aboveTerrain > cfg.MaxAboveTerrain && step > cfg.MaxAboveTerrain
+                && ctx.NavReady && VehicleMask(out GraphMask vm))
+            {
+                ctx.Queries++; ctx.QueriesSinceYield++;
+                string why = "";
+                NNInfo vn = Nearest(new Vector3(cand.x, groundY, cand.z), vm, NavSearch);
+                if (vn.node == null) why = "no ground-vehicle navmesh";
+                else
+                {
+                    float vdy = Mathf.Abs(vn.position.y - groundY), vdxz = Dist2D(vn.position, cand);
+                    uint? mainA = AreaOf(MainRef(vm, out _));
+                    uint? a = AreaOf(vn.node);
+                    if (vdxz > cfg.NavMaxHorizontal + 0.4f * u.Radius || vdy > cfg.NavMaxHeight + 0.4f * u.Radius)
+                        why = $"ground-vehicle navmesh {vdxz:F1} m / {vdy:F1} m away";
+                    else if (mainA.HasValue && a != mainA) why = $"ground-vehicle navmesh piece {a} is not the main component {mainA}";
+                }
+                if (why.Length > 0)
+                {
+                    reason = $"elevated top ({why}): {where}";
+                    return SevRoof;
+                }
             }
 
             // clearance: static world the cast could not see, units, invisible walls
@@ -670,7 +903,7 @@ namespace Si_StarterUnits
                 NNInfo nn = Nearest(groundPt, u.Mask, NavSearch);
                 if (nn.node == null)
                 {
-                    reason = $"no navmesh within {NavSearch:F0} m (landed on {landedOn})";
+                    reason = $"no navmesh within {NavSearch:F0} m: {where}";
                     return SevNav;
                 }
                 float dy = Mathf.Abs(nn.position.y - groundY);
@@ -678,16 +911,16 @@ namespace Si_StarterUnits
                 float tolY = cfg.NavMaxHeight + 0.4f * u.Radius + u.NavSlack;   // a wide box rests on the highest bump under it
                 if (dxz > cfg.NavMaxHorizontal + u.NavSlack || dy > tolY)
                 {
-                    reason = $"off navmesh: nearest node {dxz:F1} m away, {dy:F1} m height difference (landed on {landedOn})";
+                    reason = $"off navmesh: nearest node {dxz:F1} m away, {dy:F1} m height difference: {where}";
                     return SevNav;
                 }
+                uint? refArea = AreaOf(refNode);   // read now: areas are renumbered after graph updates
                 if (refArea.HasValue)
                 {
-                    uint area = refArea.Value;
-                    try { area = nn.node.Area; } catch { }
-                    if (area != refArea.Value)
+                    uint? area = AreaOf(nn.node);
+                    if (area.HasValue && area.Value != refArea.Value)
                     {
-                        reason = $"isolated navmesh area {area} (base area {refArea.Value}, landed on {landedOn})";
+                        reason = $"isolated navmesh piece (area {area.Value}, reference {refArea.Value} = {refHow}): {where}";
                         return SevIsland;
                     }
                 }
@@ -695,47 +928,66 @@ namespace Si_StarterUnits
             return 0;
         }
 
-        /// <summary>Connected navmesh component (GraphNode.Area) of the base for the unit's graph: weighted vote of
-        /// the nearest nodes to the base and to 4 points just outside it (weight 3 each) and to 8 ring points (weight 1).
-        /// Null (no island test) with fewer than 3 votes.</summary>
-        static uint? RefArea(PassContext ctx, UnitSpec u, Vector3 fwd, PlacementConfig cfg)
+        /// <summary>Reference component for the island test, as a NODE (its Area is read at query time, see MainRef):
+        /// 13 probes around the base (the base, 4 points just outside it, 8 on the ring; each at the top surface
+        /// there) snap to the unit's graph; probes more than max_step_from_base_m from the base ground are ignored
+        /// (another level). If any probe lands on the graph's MAIN component, the reference is the main component:
+        /// a base on a platform or roof piece whose own navmesh is cut off still sends its units to the ground they
+        /// can drive out on. Otherwise the weighted vote of 1.3.0 (base + near probes weight 3, ring weight 1), e.g. a
+        /// base on its own island. Null (no island test) with fewer than 3 votes. Recomputed when the node died.</summary>
+        static (GraphNode? node, string how) RefNode(PassContext ctx, UnitSpec u, Vector3 fwd, PlacementConfig cfg)
         {
             int key = u.Mask.value;
-            if (ctx.RefAreas.TryGetValue(key, out var cached)) return cached;
-            var votes = new Dictionary<uint, int>();
+            if (ctx.RefNodes.TryGetValue(key, out var cached) && (cached.node == null || Alive(cached.node))) return cached;
+
+            GraphNode? main = MainRef(u.Mask, out string mainInfo);
+            uint? mainArea = AreaOf(main);
+            var votes = new Dictionary<uint, (int w, GraphNode n)>();
+            int probes = 0, onMain = 0, otherLevel = 0;
             void Vote(Vector3 p, int w)
             {
                 try
                 {
                     ctx.Queries++; ctx.QueriesSinceYield++;
+                    probes++;
                     NNInfo nn = Nearest(p, u.Mask, NavRefSearch);
                     if (nn.node == null) return;
-                    uint a = nn.node.Area;
-                    votes.TryGetValue(a, out int c);
-                    votes[a] = c + w;
+                    if (Mathf.Abs(nn.position.y - ctx.BaseGroundY) > cfg.MaxStepFromBase) { otherLevel++; return; }
+                    uint? a = AreaOf(nn.node);
+                    if (!a.HasValue) return;
+                    if (a == mainArea) onMain++;
+                    votes.TryGetValue(a.Value, out var c);
+                    votes[a.Value] = (c.w + w, nn.node);
                 }
                 catch { }
             }
-            // next to the base structure (just outside its navmesh cut), weight 3 each: the base's own component wins
-            Vote(ctx.BasePos, 3);
-            for (int k = 0; k < 4; k++)
+            Vector3 At(Vector3 p)
             {
-                Vector3 p = ctx.BasePos + (Quaternion.Euler(0f, 45f + 90f * k, 0f) * fwd) * Mathf.Max(30f, cfg.MinRadius * 0.6f);
-                p.y = TerrainHeight(p) ?? ctx.BasePos.y;
-                Vote(p, 3);
+                ctx.Queries++; ctx.QueriesSinceYield++;
+                p.y = SurfaceY(p.x, p.z, ctx.BaseGroundY) ?? (TerrainHeight(p) ?? ctx.BaseGroundY);
+                return p;
             }
+            // next to the base structure (just outside its navmesh cut), weight 3 each
+            Vote(new Vector3(ctx.BasePos.x, ctx.BaseGroundY, ctx.BasePos.z), 3);
+            for (int k = 0; k < 4; k++)
+                Vote(At(ctx.BasePos + (Quaternion.Euler(0f, 45f + 90f * k, 0f) * fwd) * Mathf.Max(30f, cfg.MinRadius * 0.6f)), 3);
             // ring probes, weight 1 each
             for (int k = 0; k < 8; k++)
+                Vote(At(ctx.BasePos + (Quaternion.Euler(0f, 45f * k, 0f) * fwd) * cfg.RingRadius), 1);
+
+            (GraphNode? node, string how) result;
+            string tail = $"{probes} probes, {onMain} on main, {otherLevel} on another level; graph '{GraphName(u.Mask)}': {mainInfo}";
+            if (onMain > 0 && main != null)
+                result = (main, "main component");
+            else
             {
-                Vector3 p = ctx.BasePos + (Quaternion.Euler(0f, 45f * k, 0f) * fwd) * cfg.RingRadius;
-                p.y = TerrainHeight(p) ?? ctx.BasePos.y;
-                Vote(p, 1);
+                GraphNode? best = null; int bestW = 0, total = 0; uint bestA = 0;
+                foreach (var kv in votes) { total += kv.Value.w; if (kv.Value.w > bestW) { bestW = kv.Value.w; best = kv.Value.n; bestA = kv.Key; } }
+                result = total >= 3 && best != null ? (best, $"base component {bestA} (no probe on main)") : ((GraphNode?)null, "none (too few probes on the navmesh)");
             }
-            uint? best = null; int bestVotes = 0, total = 0;
-            foreach (var kv in votes) { total += kv.Value; if (kv.Value > bestVotes) { bestVotes = kv.Value; best = kv.Key; } }
-            if (total < 3) best = null;
-            ctx.RefAreas[key] = best;
-            return best;
+            ctx.RefNodes[key] = result;
+            MelonLogger.Msg($"[STARTER] {(ctx.Audit ? "audit" : "placement")} {ctx.Map} {ctx.Label}: island reference for '{u.Name}' = {result.how} ({tail})");
+            return result;
         }
 
         /// <summary>One log line per relocated / fallback unit.</summary>
@@ -780,13 +1032,16 @@ namespace Si_StarterUnits
                         alive++;
                         LearnMask(u);
                         string issue = CheckUnit(u, r.Spec, nav, cfg);
+                        // 1.3.1: the spawn point itself under a floor is a placement fault whatever the unit did since
+                        string spawnUnder = UnderFloor(r.SpawnPos.x, r.SpawnPos.y + r.Spec.Center.y - r.Spec.Extents.y, r.SpawnPos.z, 2f * r.Spec.Extents.y);
+                        if (spawnUnder.Length > 0) issue = "spawned " + spawnUnder + (issue.Length > 0 ? "; now: " + issue : "");
                         if (cfg.LogAll) MelonLogger.Msg($"[STARTER] post-check detail {map} {r.Label} '{r.Spec.Name}': spawned {V(r.SpawnPos)} now {V(u.transform.position)} " +
                                                         $"(moved {Dist2D(r.SpawnPos, u.transform.position):F1} m, dy {u.transform.position.y - r.SpawnPos.y:F1} m, {u.transform.position.y - (TerrainHeight(u.transform.position) ?? 0f):F1} m above terrain){(issue.Length > 0 ? " -> " + issue : "")}");
                         if (issue.Length == 0) continue;
                         // A unit that walked or flew away from its spawn point is not stuck there: an alien climbing a
                         // pillar 5 s after spawning is the AI moving it, not a placement fault. Below-terrain always counts.
                         float moved = Dist2D(r.SpawnPos, u.transform.position);
-                        if (moved > MovedLimit && issue.IndexOf("below terrain", StringComparison.Ordinal) < 0)
+                        if (moved > MovedLimit && spawnUnder.Length == 0 && issue.IndexOf("below terrain", StringComparison.Ordinal) < 0)
                         {
                             movedIgnored++;
                             MelonLogger.Msg($"[STARTER] post-check note {map} {r.Label} '{r.Spec.Name}' at {V(u.transform.position)}: {issue} (moved {moved:F0} m since spawn: not a placement fault)");
@@ -804,8 +1059,9 @@ namespace Si_StarterUnits
             else MelonLogger.Warning($"[STARTER] post-check {map}: {flagged} of {alive} units flagged{goneTxt}");
         }
 
-        /// <summary>"" when fine, else what is wrong: below terrain (vanilla fall-through criterion), embedded in a
-        /// static collider (box shrunk to 80 % so resting contact does not count), off the navmesh.</summary>
+        /// <summary>"" when fine, else what is wrong: below terrain (vanilla fall-through criterion), under a floor
+        /// (a walkable static surface above the unit at its x/z, see UnderFloor), embedded in / inside a static
+        /// collider, off the navmesh.</summary>
         static string CheckUnit(Unit u, UnitSpec spec, bool nav, PlacementConfig cfg)
         {
             var issues = new List<string>();
@@ -818,6 +1074,12 @@ namespace Si_StarterUnits
             float? th = TerrainHeight(pos);
             if (th.HasValue && th.Value - pos.y > radius + 5f)
                 issues.Add($"below terrain by {th.Value - pos.y:F1} m");
+
+            // 1.3.1: under a walkable static surface (IndustrialQuarter metal floor above, heightmap under the feet)
+            Vector3 c;
+            try { c = u.WorldPhysicalCenter; } catch { c = pos + rot * spec.Center; }
+            string under = UnderFloor(c.x, c.y - spec.Extents.y, c.z, 2f * spec.Extents.y);
+            if (under.Length > 0) issues.Add(under);
 
             string emb = Embedded(u);
             if (emb.Length > 0) issues.Add(emb);

@@ -11,7 +11,7 @@ Use the [**interactive web tool**](https://drmuck.github.io/Si_StarterUnits/) to
 - **Per-faction starter units** — Sol, Centauri, Alien, Wildlife each get their own JSON
 - **4-way cross-spawns** — drop units from one faction at another faction's spawn (subscribes to Si_4way events)
 - **2v1 lone-team multiplier** (1.2.0) — with Si_VersusVote 0.3.0+ the lone team of a 2v1 round gets its counts multiplied (see below)
-- **Placement validation** (1.3.0) — every starter is checked for solid ground, navmesh reachability and free space before it is spawned and moved to the nearest valid spot otherwise; summary + post-spawn self-check in the server log; `!starteraudit` dry run (see below)
+- **Placement validation** (1.3.0, reworked in 1.3.1) — every starter is checked for solid ground, navmesh reachability and free space before it is spawned and moved to the nearest valid spot otherwise; elevated playable ground (IndustrialQuarter metal floors, Citadel plateaus) counts as ground; summary + post-spawn self-check in the server log; `!starteraudit` dry run (see below)
 - **Hot configurable** — edit the JSONs between rounds; no code change required
 - **Hidden from the regular spawn flow** — runs after `MP_Strategy.OnMissionStateChanged` so it slots in after the game's own startup logic
 
@@ -22,22 +22,35 @@ commander phase) a coroutine waits 5 s and then spawns every faction's list arou
 structure whose ObjectInfo is `Team.BaseStructure`, else the first structure), unit *i* of *N* planned on a 120 m
 circle at angle 360/N·i. The JSON files are read at that moment, so edits apply from the next round.
 
-### Placement validation (1.3.0)
+### Placement validation (1.3.0, 1.3.1)
 
-Before 1.3.0 every unit was put at its ring slot at terrain height + 1 m with no check at all, so a base next to a
-cliff, rock or building (Citadel, IndustrialQuarter, NarakaCity) put starters inside or on top of the geometry.
-Since 1.3.0 each unit is placed like this:
+Before 1.3.0 every unit was put at its ring slot at heightmap height + 1 m with no check at all, so a base next to a
+cliff, rock or building (Citadel, IndustrialQuarter, NarakaCity) put starters inside or on top of the geometry. On
+IndustrialQuarter the steel-plated "metal floor" platforms (`Industrial_Floor_06`, 13 m above the heightmap) are the
+real ground; heightmap + 1 m is under that floor. 1.3.0 treated the floor as a roof (4 m height rule) and relocated
+or fell back for no reason; 1.3.1 treats it as ground. Each unit is placed like this:
 
 1. **Landing** — a `Physics.BoxCast` straight down with the unit's collision box against
    `GamePhysics.TRACELAYERMASK_IGNOREDYNAMIC`, triggers ignored: the same cast and mask the game uses to drop its own
    initial units (`StrategyTeamSetup.SpawnAIUnits`), teleports (`TeleportUI`) and units that fell through the ground
    (`Unit.UpdateFallThroughGround`). The box (widened by `clearance_margin_m`) comes to rest on the first solid
    surface. A `Physics.CheckBox` at the cast start rules out the cast's blind spot (colliders that already contain it).
+   The cast comes from above, so a unit always stands ON the top surface (metal floor, plateau), never on the
+   heightmap underneath it.
    The box comes from the prefab's solid colliders (non-trigger, movement layers); `ObjectInfo.PhysicalBounds` is
    only the fallback because it is far too large for some creatures (Shocker 4.6 x 19.8 x 19.8 m vs a 4 m collider).
-2. **Height** — rejected when the landing surface is more than `max_height_above_terrain_m` (4 m) above the terrain
-   at that spot (roof, oil tank, catwalk, cliff or rock top) or more than `max_step_from_base_m` (25 m) above or
-   below the terrain at the base (another level of the map).
+2. **Level** (1.3.1) — rejected when the landing surface is more than `max_step_from_base_m` (25 m) above or below
+   the **base ground** (another level of the map). Base ground = the surface the base actually stands on: a ray down
+   from 10 m above the base pivot, base structures and units ignored (1.3.0 used the heightmap there, 13 m under an
+   IndustrialQuarter platform and up to ~100 m under a Citadel plateau). There is **no heightmap-based roof rule**
+   any more for vehicles and infantry: roofs, oil tanks and pillar tops are separate small pieces of their navmesh
+   or have none, and fail in 4.
+   **Elevated surface** (alien ground units and flying units only): a non-terrain landing more than
+   `max_height_above_terrain_m` (4 m) above both the heightmap at that spot and the base ground (roof, tank,
+   catwalk, pillar or rock top) is accepted only if the ground-vehicle navmesh (`Small Vehicle`) has a node there on
+   its main component, i.e. it is drivable ground connected to the map. Reason: the alien `Voxel Graph` covers walls
+   and roofs (alien ground units climb), so the aliens' own navmesh cannot tell a floor from a tank top, and flying
+   units have no navmesh test. A platform the Nest itself stands on is never "elevated" (it is the base ground).
 3. **Clearance** — `Physics.OverlapBox` of the landed box against static world layers, units (Character, Vehicle,
    Dynamic) and invisible walls, triggers ignored; and at least `unit_gap_m` between this unit and every starter
    already placed in this pass.
@@ -45,13 +58,23 @@ Since 1.3.0 each unit is placed like this:
    `Seeker.graphMask`, or that of a live unit of the same type) must be within `nav_max_horizontal_delta_m` /
    `nav_max_height_delta_m` of the landing point, as `GameAI.GetPointValidForAI` / `MP_Strategy.GetStartPointOffNavmesh`
    query it. For the alien voxel graph, whose nodes are points, the voxel size is added as slack. With
-   `nav_island_check` the node must be in the base's connected navmesh component (`GraphNode.Area`): no isolated
-   ledges or roof islands.
+   `nav_island_check` the node must be in the **reference component**: 13 probes around the base (base, 4 just
+   outside it, 8 on the ring, each at the top surface there; probes on another level than the base ground ignored)
+   snap to the unit's graph; if any of them reaches the graph's **main component** (the `GraphNode.Area` with the
+   most walkable nodes), that is the reference, so a base on a platform whose own navmesh piece is cut off sends its
+   units to the ground they can drive out on (1.3.0 voted for the platform piece and then rejected all real ground
+   as "isolated"). Otherwise the 1.3.0 weighted vote decides (a base on its own island). The reference is kept as a
+   **node** and its `Area` is read at query time, because A* renumbers `GraphNode.Area` after graph updates (seen on
+   CrystalChasm: one component as 13955, 13957, 13959 within one scan); the main component is recomputed (one node
+   walk) when its reference node was destroyed by a tile rebuild.
 
 The first candidate is the 1.2.0 ring slot, so layouts that were fine stay exactly as they were. If it fails, up to
 `max_candidates_per_unit` spots around it are tried (rings of 8 at 12 … 190 m from the slot, tangential first, kept
 within `min_radius_m` … `max_radius_m` of the base); the first valid one wins. If none is valid the least bad
-candidate is used (closest to valid, then closest to the slot) with a warning; a unit is never dropped. Cost: about
+candidate is used (closest to valid, then closest to the slot) with a warning, always at its landed pose; a unit is
+never dropped. Severity order since 1.3.1 (least bad first): only other units in the way, another level, elevated
+top, isolated navmesh piece / off the navmesh, inside static geometry. If no candidate landed at all: the ring slot
+on the top surface + 1 m (1.3.0: heightmap + 1 m). Cost: about
 4–5 physics/navmesh queries per candidate, 4–5 per unit on a clean map, worst case ~320 per unit; the pass yields a
 frame every `queries_per_frame` queries.
 
@@ -59,33 +82,47 @@ frame every `queries_per_frame` queries.
 
 ```
 [STARTER] unit 'Shocker': box 4.0x4.0x4.0 m (1 prefab colliders, ...; PhysicalBounds 4.6x19.8x19.8 ...), graph 'Voxel Graph' (live unit, node spacing slack ...)
-[STARTER] placement relocated IndustrialQuarter alien 'Shocker' #2: (354,270,1007) -> (378,270,1015) (25 m, candidate 14, landed on terrain, ground 0.1 m above terrain); planned spot: on top of 'HugeOilTank_Grey_19' [Static], 10.4 m above terrain
+[STARTER] placement relocated <map> <team> '<unit>' #i: (x,y,z) -> (x,y,z) (d m, candidate n, landed on <surface>, h m above terrain, +s m vs base ground); planned spot: <why>
+    <why> = other level: ... | elevated top (no ground-vehicle navmesh | ground-vehicle navmesh piece a is not the main component m): ...
+          | isolated navmesh piece (area a, reference r = main component | base component b): ... | off navmesh: ... | overlaps '<collider>' ...
+[STARTER] placement <map> <team>: island reference for '<unit>' = main component (13 probes, 5 on main, 0 on another level; graph 'Small Vehicle': N walkable nodes, C components, main M)
 [STARTER] placement FALLBACK <map> <team> '<unit>' #i: no valid spot in N candidates, using (x,y,z) (<why>); planned (x,y,z): <why>     (warning)
-[STARTER] placement IndustrialQuarter alien: 10 units, 3 as planned, 7 relocated, 0 fallback (136 queries)
+[STARTER] placement <map> <team>: 10 units, 3 as planned, 7 relocated, 0 fallback (136 queries, base ground 283 ('Industrial_Floor_06' ... [Static], 13.0 m above the heightmap))
+[STARTER] audit <map> <label>: ..., under a floor: 1.2.0 slot N, chosen 0 (...)        (audit only)
 [STARTER] post-check IndustrialQuarter: all 18 units clear
-[STARTER] post-check <map> <team> '<unit>' at (x,y,z): embedded in '<collider>' [layer] (penetration 1.2 m) | inside '<collider>' | below terrain by X m | off navmesh (...) (moved d m since spawn at (x,y,z))   (warning)
+[STARTER] post-check <map> <team> '<unit>' at (x,y,z): spawned under a floor: ... | under a floor: '<collider>' [layer] h m above its feet, feet on the heightmap | embedded in '<collider>' [layer] (penetration 1.2 m) | inside '<collider>' | below terrain by X m | off navmesh (...) (moved d m since spawn at (x,y,z))   (warning)
 [STARTER] post-check note <map> <team> '<unit>' at (x,y,z): <finding> (moved 17 m since spawn: not a placement fault)
 [STARTER] sol: team not in this round, no starters
 ```
 
 The **post-check** runs `post_check_delay_s` (5 s) after the spawn for every unit this mod spawned: below the terrain
-(the game's own fall-through criterion), **embedded** = one of the unit's live solid colliders interpenetrates a static
+(the game's own fall-through criterion), **under a floor** (1.3.1) = the first world surface straight above the
+unit's x/z (ray from 500 m above, base structures and units ignored) is not terrain, faces up and lies more than
+0.5 m above the unit's top, i.e. the unit stands under a walkable floor (the 1.2.0 fault on IndustrialQuarter: metal
+floor above, heightmap under the feet), **embedded** = one of the unit's live solid colliders interpenetrates a static
 collider by more than 0.5 m (`Physics.ComputePenetration`; standing on a surface or touching a wall does not count),
 **inside** = completely enclosed in a mesh (a mesh collider is only a surface, so a unit fully inside a rock touches
 no triangle: rays from the unit with `Physics.queriesHitBackfaces` hit back faces up and sideways), or off the
 navmesh. A unit that has moved more than 5 m from its spawn point in those seconds is not stuck there (aliens climb
 pillars and walls right away); its finding is logged as a `post-check note` and not counted, except below-terrain.
+The under-a-floor test is also run on the **spawn point** itself (`spawned under a floor: ...`); that one always
+counts, because it is a placement fault whatever the unit did since (a flying Squid that hovers under a building
+5 s later is not).
 With `log_all_placements` every unit gets a `post-check detail` line (spawn point, position now, movement, height).
 
 ### `!starteraudit` (admin, needs the Admin Mod)
 
 Dry run, nothing is spawned, units are ignored (static world only). Detail lines and summaries go to the server log
-with the `audit` verb, the caller gets a one-line summary in chat.
+with the `audit` verb, the caller gets a one-line summary in chat. The audit always runs the validation (1.3.1: also
+with `validate_placement: false` or the test switch). Each pass summary also counts how many 1.2.0 ring slots
+(heightmap + 1 m) would be under a floor and how many chosen spots are (expected 0; each one is a warning line).
 
 - `!starteraudit` — every faction config at its team's current base.
 - `!starteraudit layouts` — every place a base can stand on the current map: the map's vanilla start points
   (`MP_Strategy.TeamSetups[].BaseStructureStartPoints`), every Si_MapBalance layout in
-  `UserData/cfg/Spawns/<map>/` (read as plain JSON, first entry per faction like Si_MapBalance; base forward +Z), and
+  `UserData/cfg/Spawns/<map>/` (read as plain JSON, first entry per faction like Si_MapBalance; base forward +Z, or
+  the entry's optional `"rot"` in degrees (Si_MapBalance 3.6.0) as `Euler(0, rot, 0) * +Z`; base height = the top
+  surface at x/z like Si_MapBalance's `SampleSurfaceHeight`, 1.3.0: the heightmap), and
   audit-only test positions in `UserData/cfg/StarterUnits/audit/<map>/*.json` (same format, every entry). Si_MapBalance
   does not have to be loaded.
 - `auto_audit_layouts: true` in `placement.json` runs the layout audit once per map per server run after the
@@ -93,20 +130,22 @@ with the `audit` verb, the caller gets a one-line summary in chat.
 
 ### placement.json
 
-`UserData/cfg/StarterUnits/placement.json`, written with these defaults when missing, read at every round start:
+`UserData/cfg/StarterUnits/placement.json`, written with these defaults when missing, read at every round start
+(a file written by 1.3.0 is read as it is; the missing 1.3.1 key takes its default):
 
 | Key | Default | Meaning |
 |--|--|--|
-| `validate_placement` | `true` | `false` = 1.2.0 behaviour (ring slot, terrain + 1 m, no checks); summary and post-check still run |
+| `validate_placement` | `true` | `false` = ring slot on the top surface + 1 m, no checks (1.3.0: heightmap + 1 m = 1.2.0); summary and post-check still run |
 | `ring_radius_m` | 120 | planned ring radius |
 | `min_radius_m` / `max_radius_m` | 60 / 250 | search limits, distance from the base |
 | `max_candidates_per_unit` | 64 | search budget per unit |
 | `clearance_margin_m` | 1.0 | added to each horizontal side of the unit box |
 | `unit_gap_m` | 2.0 | space between starters |
 | `nav_max_horizontal_delta_m` / `nav_max_height_delta_m` | 3 / 3 | navmesh snap tolerance (height + 0.4 x unit radius) |
-| `nav_island_check` | `true` | same navmesh component as the base |
-| `max_height_above_terrain_m` | 4 | roof / rock / cliff-top limit |
-| `max_step_from_base_m` | 25 | height difference to the base ground |
+| `nav_island_check` | `true` | same navmesh component as the reference (main component if reachable next to the base) |
+| `max_height_above_terrain_m` | 4 | **meaning changed in 1.3.1**: elevated-surface threshold (above both heightmap and base ground) for alien ground and flying units, which must then be on the main ground-vehicle navmesh; not used for vehicles/infantry. 1.3.0: hard limit above the heightmap for every unit. Existing files keep working unchanged |
+| `max_step_from_base_m` | 25 | height difference to the base ground (1.3.1: the surface the base stands on; 1.3.0: the heightmap there) |
+| `test_legacy_heightmap_placement` | `false` | **test only** (1.3.1): live spawns use the 1.2.0 placement exactly (heightmap + 1 m, no checks) to reproduce the under-floor fault for the post-check; warning every round; the audit ignores it. Never on a played server |
 | `post_check_delay_s` | 5 | 0 = no post-check |
 | `queries_per_frame` | 200 | yield a frame after this many queries |
 | `auto_audit_layouts` | `false` | layout audit once per map per run |
@@ -233,6 +272,12 @@ Build output: `Si_StarterUnits/bin/Release/netstandard2.1/Si_StarterUnits.dll`.
 
 ## Changelog
 
+- **1.3.1** (2026-11-12): elevated playable ground is ground. Base ground = the surface the base stands on (not the
+  heightmap); no heightmap roof rule for vehicles/infantry (their navmesh main component decides); elevated-surface
+  rule for alien ground and flying units via the ground-vehicle navmesh; island reference = main component when
+  reachable next to the base, tracked by a node (A* renumbers areas); no code path uses the heightmap as the
+  landing height (slot, no-landing fallback, check-failed pose); post-check "under a floor"; audit: base on the top
+  surface, layout `"rot"` honoured, under-floor counts, always validates; `test_legacy_heightmap_placement` switch.
 - **1.3.0** (2026-11-12): placement validation (landing cast, height, clearance, navmesh + island check, local
   search, fallback with warning), per-team placement summary, post-spawn self-check, `!starteraudit [layouts]`,
   `placement.json`; base = the team's `BaseStructure`; "team not in this round" is an info line now.

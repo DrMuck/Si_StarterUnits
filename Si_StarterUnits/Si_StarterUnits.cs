@@ -7,6 +7,9 @@
  1.3.0: placement validation (Placement.cs): every starter is landed, ground/navmesh- and clearance-checked before it is
         spawned, relocated near its ring slot when the slot is bad; per-team placement summary, post-spawn self-check,
         admin audit command !starteraudit (AdminCommand.cs, only with the Admin Mod loaded).
+ 1.3.1: elevated playable ground (IndustrialQuarter metal floors, Citadel plateaus) is ground: base ground = the surface
+        the base stands on, no heightmap-based roof rule (navmesh main component + elevated-surface rule instead),
+        island reference = main component tracked by node; post-check "under a floor"; audit honours the layout "rot".
 */
 
 using System;
@@ -59,7 +62,7 @@ namespace Si_StarterUnits
 
     public class StarterUnits : MelonMod
     {
-        public const string Version = "1.3.0";
+        public const string Version = "1.3.1";
 
         /// <summary>UserData/cfg/StarterUnits — the server's cfg/ folder. A pre-1.1
         /// UserData/StarterUnits/ folder is moved there once.</summary>
@@ -215,6 +218,8 @@ namespace Si_StarterUnits
             {
                 MelonLogger.Error($"[STARTER] Preparing the spawn failed: {ex.Message}");
             }
+            if (cfg.LegacyHeightmap)
+                MelonLogger.Warning("[STARTER] test_legacy_heightmap_placement is ON: 1.2.0 placement (heightmap + 1 m, no checks) - test only, units can end up under floors");
 
             string map = Placer.MapName();
             int totalSpawned = 0;
@@ -353,8 +358,9 @@ namespace Si_StarterUnits
             ctx.Label = job.Label;
             ctx.BasePos = job.BasePos;
             ctx.BaseForward = job.BaseForward;
-            ctx.BaseGroundY = Placer.TerrainHeight(job.BasePos) ?? job.BasePos.y;
+            ctx.BaseGroundY = Placer.BaseGround(job.BasePos, out ctx.BaseGroundInfo);
             ctx.IgnoreUnits = !spawn;
+            ctx.Audit = !spawn;
             ctx.NavReady = Placer.NavReady(out ctx.NavState);
             string verb = spawn ? "placement" : "audit";
             var specs = new Dictionary<ObjectInfo, UnitSpec>();
@@ -410,7 +416,8 @@ namespace Si_StarterUnits
         {
             Vector3 dir = Quaternion.Euler(0f, (360f / total) * i, 0f) * job.BaseForward;
             Vector3 pos = job.BasePos + dir * cfg.RingRadius;
-            pos.y = (Placer.TerrainHeight(pos) ?? pos.y) + 1f;
+            // top surface there (never the heightmap under a floor), else the base's height
+            pos.y = (Placer.SurfaceY(pos.x, pos.z, job.BasePos.y) ?? job.BasePos.y) + 1f;
             return new PlaceResult
             {
                 Planned = pos, Position = pos,
@@ -531,8 +538,8 @@ namespace Si_StarterUnits
         /// <summary>
         /// Evaluates the starter positions without spawning anything, against the static world only (units ignored).
         /// layouts = false: every faction config at its team's current base. layouts = true: every Si_MapBalance
-        /// layout JSON in UserData/cfg/Spawns/&lt;map&gt;/ (first entry per faction, base forward +Z, base height =
-        /// terrain). Detail lines + summaries go to the server log; <paramref name="reply"/> gets one line.
+        /// layout JSON in UserData/cfg/Spawns/&lt;map&gt;/ (first entry per faction, base forward +Z or the entry's "rot",
+        /// base height = top surface). Detail lines + summaries go to the server log; <paramref name="reply"/> gets one line.
         /// </summary>
         internal static void StartAudit(bool layouts, Action<string> reply)
         {
@@ -550,6 +557,9 @@ namespace Si_StarterUnits
             try
             {
                 cfg = PlacementConfig.Load(ConfigDir);
+                // the audit always evaluates the validation, whatever validate_placement / the test switch say
+                cfg.Enabled = true;
+                cfg.LegacyHeightmap = false;
                 jobs = layouts ? CollectLayoutJobs(map, BuildInfoIndex(), out error) : CollectSpawnJobs(BuildInfoIndex());
             }
             catch (Exception ex) { error = ex.Message; }
@@ -583,10 +593,12 @@ namespace Si_StarterUnits
         ///     Si_MapBalance may have moved one of them this round);
         ///  2. every Si_MapBalance layout in UserData/cfg/Spawns/&lt;map&gt;/, read as plain JSON (no reference to
         ///     Si_MapBalance): web-tool format ("Sol": [{"x":..,"z":..}], first entry, as Si_MapBalance uses it) and
-        ///     legacy variants ("variant": {"Sol": {"x":..,"z":..}}); base forward +Z;
+        ///     legacy variants ("variant": {"Sol": {"x":..,"z":..}}); base forward +Z, or Euler(0, rot, 0) * +Z when the
+        ///     entry has the optional "rot" (degrees; Si_MapBalance 3.6.0);
         ///  3. audit-only extra points in UserData/cfg/StarterUnits/audit/&lt;map&gt;/*.json, same format, every entry of
         ///     each faction array (for testing a base position no layout uses yet).
-        /// Base height = terrain height.
+        /// Base height = the top surface at x/z (first world hit from above, as Si_MapBalance's SampleSurfaceHeight;
+        /// 1.3.0 used the heightmap, which is under IndustrialQuarter's metal floor).
         /// </summary>
         private static List<SpawnJob> CollectLayoutJobs(string map, Dictionary<string, ObjectInfo> infoByName, out string error)
         {
@@ -612,16 +624,19 @@ namespace Si_StarterUnits
             }
             if (factionUnits.Count == 0) { error = "no faction config with units"; return jobs; }
 
-            void Add(string label, string faction, Vector3 xz, Vector3 forward)
+            void Add(string label, string faction, Vector3 xz, Vector3 forward, float? rot = null)
             {
                 if (!factionUnits.TryGetValue(faction, out var units)) return;
                 float? th = Placer.TerrainHeight(xz);
                 if (!th.HasValue) { MelonLogger.Warning($"[STARTER] audit {label}: ({xz.x:F0},{xz.z:F0}) outside the terrain"); return; }
+                // 1.3.1: the base stands on the top surface (as Si_MapBalance's SampleSurfaceHeight), not the heightmap
+                float y = Placer.SurfaceY(xz.x, xz.z, th.Value) ?? th.Value;
+                if (rot.HasValue) forward = Quaternion.Euler(0f, rot.Value, 0f) * Vector3.forward;
                 jobs.Add(new SpawnJob
                 {
-                    Label = $"{label} {faction} @({xz.x:F0},{xz.z:F0})",
+                    Label = $"{label} {faction} @({xz.x:F0},{xz.z:F0})" + (rot.HasValue ? $" rot {rot.Value:F0}" : ""),
                     Team = null!,
-                    BasePos = new Vector3(xz.x, th.Value, xz.z),
+                    BasePos = new Vector3(xz.x, y, xz.z),
                     BaseForward = forward,
                     Units = units,
                 });
@@ -670,14 +685,14 @@ namespace Si_StarterUnits
                                 if (faction == null) continue;
                                 for (int i = 0; i < arr.Count && (allEntries || i == 0); i++)
                                     if (arr[i] is JObject e)
-                                        Add(layout + (allEntries ? "#" + i : ""), faction, XZ(e), Vector3.forward);
+                                        Add(layout + (allEntries ? "#" + i : ""), faction, XZ(e), Vector3.forward, Rot(e));
                             }
                             else if (prop.Value is JObject variant)
                             {
                                 foreach (var fp in variant.Properties())
                                 {
                                     string? faction = LayoutFaction(fp.Name);
-                                    if (faction != null && fp.Value is JObject e) Add(layout + "/" + prop.Name, faction, XZ(e), Vector3.forward);
+                                    if (faction != null && fp.Value is JObject e) Add(layout + "/" + prop.Name, faction, XZ(e), Vector3.forward, Rot(e));
                                 }
                             }
                         }
@@ -690,6 +705,16 @@ namespace Si_StarterUnits
         }
 
         private static Vector3 XZ(JObject e) => new Vector3(e["x"]?.Value<float>() ?? 0f, 0f, e["z"]?.Value<float>() ?? 0f);
+
+        /// <summary>Optional layout field "rot" (Si_MapBalance 3.6.0): base yaw in degrees (the tool writes 0/90/180/270);
+        /// absent or not a number = null (base forward +Z, as before 1.3.1).</summary>
+        private static float? Rot(JObject e)
+        {
+            var t = e["rot"];
+            if (t == null || (t.Type != JTokenType.Integer && t.Type != JTokenType.Float)) return null;
+            float r = t.Value<float>();
+            return float.IsNaN(r) || float.IsInfinity(r) ? (float?)null : r;
+        }
 
         private static string? TeamFaction(Team team)
         {
