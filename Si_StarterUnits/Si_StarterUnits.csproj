@@ -21,5 +21,11 @@
     <Reference Include="$(SilicaRefs)UnityEngine.dll"><Private>False</Private></Reference>
     <Reference Include="$(SilicaRefs)UnityEngine.CoreModule.dll"><Private>False</Private></Reference>
     <Reference Include="$(SilicaRefs)UnityEngine.TerrainModule.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)UnityEngine.PhysicsModule.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)AstarPathfindingProject.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)PackageTools.dll"><Private>False</Private></Reference>
+    <Reference Include="$(SilicaRefs)Drawing.dll"><Private>False</Private></Reference>
+    <!-- Optional at runtime: only AdminCommand.cs uses it, and only when the Admin Mod melon is loaded -->
+    <Reference Include="$(SilicaRefs)Si_AdminMod.dll"><Private>False</Private></Reference>
   </ItemGroup>
 </Project>
